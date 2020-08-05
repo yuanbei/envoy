@@ -11,7 +11,9 @@ export LLVM_CONFIG=${LLVM_CONFIG:-llvm-config}
 LLVM_PREFIX=${LLVM_PREFIX:-$(${LLVM_CONFIG} --prefix)}
 CLANG_TIDY=${CLANG_TIDY:-$(${LLVM_CONFIG} --bindir)/clang-tidy}
 CLANG_APPLY_REPLACEMENTS=${CLANG_APPLY_REPLACEMENTS:-$(${LLVM_CONFIG} --bindir)/clang-apply-replacements}
-FIX_YAML=clang-tidy-fixes.yaml
+
+mkdir -p "${SRCDIR}/generated/clang_tidy"
+FIX_YAML="${SRCDIR}/generated/clang_tidy/fixes.yaml"
 
 # Quick syntax check of .clang-tidy.
 ${CLANG_TIDY} -dump-config > /dev/null 2> clang-tidy-config-errors.txt

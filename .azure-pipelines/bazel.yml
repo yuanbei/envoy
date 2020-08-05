@@ -57,6 +57,7 @@ steps:
       ${{ if eq(parameters.rbe, false) }}:
         BAZEL_BUILD_EXTRA_OPTIONS: "${{ parameters.bazelBuildExtraOptions }}"
         BAZEL_REMOTE_CACHE: $(LocalBuildCache)
+        RUN_FULL_CLANG_TIDY: "1"
 
     displayName: "Run CI script"
 
