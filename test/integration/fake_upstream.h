@@ -55,10 +55,16 @@ public:
   FakeStream(FakeHttpConnection& parent, Http::ResponseEncoder& encoder,
              Event::TestTimeSystem& time_system);
 
-  uint64_t bodyLength() { return body_.length(); }
-  Buffer::Instance& body() { return body_; }
+  uint64_t bodyLength() {
+    absl::MutexLock lock(&lock_);
+    return body_.length();
+  }
+  Buffer::Instance& body() {
+    absl::MutexLock lock(&lock_);
+    return body_;
+  }
   bool complete() {
-    Thread::LockGuard lock(lock_);
+    absl::MutexLock lock(&lock_);
     return end_stream_;
   }
 
@@ -75,7 +81,10 @@ public:
   void encodeResetStream();
   void encodeMetadata(const Http::MetadataMapVector& metadata_map_vector);
   void readDisable(bool disable);
-  const Http::RequestHeaderMap& headers() { return *headers_; }
+  const Http::RequestHeaderMap& headers() {
+    absl::MutexLock lock(&lock_);
+    return *headers_;
+  }
   void setAddServedByHeader(bool add_header) { add_served_by_header_ = add_header; }
   const Http::RequestTrailerMapPtr& trailers() { return trailers_; }
   bool receivedData() { return received_data_; }
@@ -87,8 +96,12 @@ public:
                  const std::function<void(Http::ResponseHeaderMap& headers)>& /*modify_headers*/,
                  const absl::optional<Grpc::Status::GrpcStatus> grpc_status,
                  absl::string_view /*details*/) override {
-    const bool is_head_request =
-        headers_ != nullptr && headers_->getMethodValue() == Http::Headers::get().MethodValues.Head;
+    bool is_head_request;
+    {
+      absl::MutexLock lock(&lock_);
+      is_head_request = headers_ != nullptr &&
+                        headers_->getMethodValue() == Http::Headers::get().MethodValues.Head;
+    }
     Http::Utility::sendLocalReply(
         false,
         Http::Utility::EncodeFunctions(
@@ -159,7 +172,7 @@ public:
       return testing::AssertionFailure() << "Timed out waiting for start of gRPC message.";
     }
     {
-      Thread::LockGuard lock(lock_);
+      absl::MutexLock lock(&lock_);
       if (!grpc_decoder_.decode(body(), decoded_grpc_frames_)) {
         return testing::AssertionFailure()
                << "Couldn't decode gRPC data frame: " << body().toString();
@@ -172,7 +185,7 @@ public:
         return testing::AssertionFailure() << "Timed out waiting for end of gRPC message.";
       }
       {
-        Thread::LockGuard lock(lock_);
+        absl::MutexLock lock(&lock_);
         if (!grpc_decoder_.decode(body(), decoded_grpc_frames_)) {
           return testing::AssertionFailure()
                  << "Couldn't decode gRPC data frame: " << body().toString();
@@ -198,7 +211,9 @@ public:
   void onAboveWriteBufferHighWatermark() override {}
   void onBelowWriteBufferLowWatermark() override {}
 
-  virtual void setEndStream(bool end) { end_stream_ = end; }
+  virtual void setEndStream(bool end) EXCLUSIVE_LOCKS_REQUIRED(lock_) {
+    end_stream_ = end;
+  }
 
   Event::TestTimeSystem& timeSystem() { return time_system_; }
 
@@ -208,17 +223,16 @@ public:
   }
 
 protected:
-  Http::RequestHeaderMapPtr headers_;
+  absl::Mutex lock_;
+  Http::RequestHeaderMapPtr headers_ ABSL_GUARDED_BY(lock_);
 
 private:
   FakeHttpConnection& parent_;
   Http::ResponseEncoder& encoder_;
-  Thread::MutexBasicLockable lock_;
-  Thread::CondVar decoder_event_;
-  Http::RequestTrailerMapPtr trailers_;
-  bool end_stream_{};
-  Buffer::OwnedImpl body_;
-  bool saw_reset_{};
+  Http::RequestTrailerMapPtr trailers_ ABSL_GUARDED_BY(lock_);
+  bool end_stream_ ABSL_GUARDED_BY(lock_){};
+  Buffer::OwnedImpl body_ ABSL_GUARDED_BY(lock_);
+  bool saw_reset_ ABSL_GUARDED_BY(lock_){};
   Grpc::Decoder grpc_decoder_;
   std::vector<Grpc::Frame> decoded_grpc_frames_;
   bool add_served_by_header_{};
@@ -248,13 +262,13 @@ public:
   }
 
   Common::CallbackHandle* addDisconnectCallback(DisconnectCallback callback) {
-    Thread::LockGuard lock(lock_);
+    absl::MutexLock lock(&lock_);
     return disconnect_callback_manager_.add(callback);
   }
 
   // Avoid directly removing by caller, since CallbackManager is not thread safe.
   void removeDisconnectCallback(Common::CallbackHandle* handle) {
-    Thread::LockGuard lock(lock_);
+    absl::MutexLock lock(&lock_);
     handle->remove();
   }
 
@@ -264,7 +278,7 @@ public:
     // callback is invoked prior to connection_ deferred delete. We also know by locking below, that
     // elsewhere where we also hold lock_, that the connection cannot disappear inside the locked
     // scope.
-    Thread::LockGuard lock(lock_);
+    absl::MutexLock lock(&lock_);
     if (event == Network::ConnectionEvent::RemoteClose ||
         event == Network::ConnectionEvent::LocalClose) {
       disconnected_ = true;
@@ -276,7 +290,7 @@ public:
   void onBelowWriteBufferLowWatermark() override {}
 
   bool connected() {
-    Thread::LockGuard lock(lock_);
+    absl::MutexLock lock(&lock_);
     return !disconnected_;
   }
 
@@ -294,14 +308,14 @@ public:
   testing::AssertionResult
   executeOnDispatcher(std::function<void(Network::Connection&)> f,
                       std::chrono::milliseconds timeout = TestUtility::DefaultTimeout) {
-    Thread::LockGuard lock(lock_);
+    absl::MutexLock lock(&lock_);
     if (disconnected_) {
       return testing::AssertionSuccess();
     }
-    Thread::CondVar callback_ready_event;
+    bool callback_ready_event = false;
     bool unexpected_disconnect = false;
     connection_.dispatcher().post(
-        [this, f, &callback_ready_event, &unexpected_disconnect]() -> void {
+        [this, f, &lock = lock_, &callback_ready_event, &unexpected_disconnect]() -> void {
           // The use of connected() here, vs. !disconnected_, is because we want to use the lock_
           // acquisition to briefly serialize. This avoids us entering this completion and issuing a
           // notifyOne() until the wait() is ready to receive it below.
@@ -310,12 +324,12 @@ public:
           } else {
             unexpected_disconnect = true;
           }
-          callback_ready_event.notifyOne();
+          absl::MutexLock lock_guard(&lock);
+          callback_ready_event = true;
         });
     Event::TestTimeSystem& time_system =
         dynamic_cast<Event::TestTimeSystem&>(connection_.dispatcher().timeSource());
-    Thread::CondVar::WaitStatus status = time_system.waitFor(lock_, callback_ready_event, timeout);
-    if (status == Thread::CondVar::WaitStatus::Timeout) {
+    if (!time_system.waitFor(lock_, absl::Condition(&callback_ready_event), timeout, true)) {
       return testing::AssertionFailure() << "Timed out while executing on dispatcher.";
     }
     if (unexpected_disconnect && !allow_unexpected_disconnects_) {
@@ -331,7 +345,7 @@ public:
 
 private:
   Network::Connection& connection_;
-  Thread::MutexBasicLockable lock_;
+  absl::Mutex lock_;
   Common::CallbackManager<> disconnect_callback_manager_ ABSL_GUARDED_BY(lock_);
   bool disconnected_ ABSL_GUARDED_BY(lock_){};
   const bool allow_unexpected_disconnects_;
@@ -357,7 +371,7 @@ public:
       : shared_connection_(connection, allow_unexpected_disconnects), parented_(false),
         allow_unexpected_disconnects_(allow_unexpected_disconnects) {
     shared_connection_.addDisconnectCallback([this] {
-      Thread::LockGuard lock(lock_);
+      absl::MutexLock lock(&lock_);
       RELEASE_ASSERT(parented_ || allow_unexpected_disconnects_,
                      "An queued upstream connection was torn down without being associated "
                      "with a fake connection. Either manage the connection via "
@@ -369,7 +383,7 @@ public:
   }
 
   void set_parented() {
-    Thread::LockGuard lock(lock_);
+    absl::MutexLock lock(&lock_);
     parented_ = true;
   }
 
@@ -377,7 +391,7 @@ public:
 
 private:
   SharedConnectionWrapper shared_connection_;
-  Thread::MutexBasicLockable lock_;
+  absl::Mutex lock_;
   bool parented_ ABSL_GUARDED_BY(lock_);
   const bool allow_unexpected_disconnects_;
 };
@@ -417,8 +431,10 @@ public:
   ABSL_MUST_USE_RESULT
   virtual testing::AssertionResult initialize() {
     initialized_ = true;
-    disconnect_callback_handle_ =
-        shared_connection_.addDisconnectCallback([this] { connection_event_.notifyOne(); });
+    disconnect_callback_handle_ = shared_connection_.addDisconnectCallback([this] {
+      absl::MutexLock lock(&lock_);
+      connection_event_ = true;
+    });
     return testing::AssertionSuccess();
   }
   ABSL_MUST_USE_RESULT
@@ -436,8 +452,8 @@ protected:
   Common::CallbackHandle* disconnect_callback_handle_;
   SharedConnectionWrapper& shared_connection_;
   bool initialized_{};
-  Thread::CondVar connection_event_;
-  Thread::MutexBasicLockable lock_;
+  absl::Mutex lock_;
+  bool connection_event_ ABSL_GUARDED_BY(lock_){};
   bool half_closed_ ABSL_GUARDED_BY(lock_){};
   Event::TestTimeSystem& time_system_;
 };
@@ -497,7 +513,7 @@ private:
   };
 
   Http::ServerConnectionPtr codec_;
-  std::list<FakeStreamPtr> new_streams_;
+  std::list<FakeStreamPtr> new_streams_ ABSL_GUARDED_BY(lock_);
 };
 
 using FakeHttpConnectionPtr = std::unique_ptr<FakeHttpConnection>;
@@ -562,7 +578,7 @@ private:
     FakeRawConnection& parent_;
   };
 
-  std::string data_;
+  std::string data_ ABSL_GUARDED_BY(lock_);
 };
 
 using FakeRawConnectionPtr = std::unique_ptr<FakeRawConnection>;
@@ -609,12 +625,12 @@ public:
   Network::Address::InstanceConstSharedPtr localAddress() const { return socket_->localAddress(); }
 
   // Wait for one of the upstreams to receive a connection
-  ABSL_MUST_USE_RESULT
+  /*ABSL_MUST_USE_RESULT
   static testing::AssertionResult
   waitForHttpConnection(Event::Dispatcher& client_dispatcher,
                         std::vector<std::unique_ptr<FakeUpstream>>& upstreams,
                         FakeHttpConnectionPtr& connection,
-                        std::chrono::milliseconds timeout = TestUtility::DefaultTimeout);
+                        std::chrono::milliseconds timeout = TestUtility::DefaultTimeout);fixfix*/
 
   // Waits for 1 UDP datagram to be received.
   ABSL_MUST_USE_RESULT
@@ -749,9 +765,8 @@ private:
   ConditionalInitializer server_initialized_;
   // Guards any objects which can be altered both in the upstream thread and the
   // main test thread.
-  Thread::MutexBasicLockable lock_;
+  absl::Mutex lock_;
   Thread::ThreadPtr thread_;
-  Thread::CondVar upstream_event_;
   Api::ApiPtr api_;
   Event::TestTimeSystem& time_system_;
   Event::DispatcherPtr dispatcher_;

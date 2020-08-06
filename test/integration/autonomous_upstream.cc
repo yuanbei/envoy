@@ -34,7 +34,10 @@ AutonomousStream::~AutonomousStream() {
 
 // By default, automatically send a response when the request is complete.
 void AutonomousStream::setEndStream(bool end_stream) {
-  FakeStream::setEndStream(end_stream);
+  {
+    absl::MutexLock lock(&lock_);
+    FakeStream::setEndStream(end_stream);
+  }
   if (end_stream) {
     sendResponse();
   }
@@ -42,8 +45,8 @@ void AutonomousStream::setEndStream(bool end_stream) {
 
 // Check all the special headers and send a customized response based on them.
 void AutonomousStream::sendResponse() {
-  Http::TestResponseHeaderMapImpl headers(*headers_);
-  upstream_.setLastRequestHeaders(*headers_);
+  Http::TestResponseHeaderMapImpl headers(this->headers());
+  upstream_.setLastRequestHeaders(this->headers());
 
   int32_t request_body_length = -1;
   HeaderToInt(EXPECT_REQUEST_SIZE_BYTES, request_body_length, headers);
